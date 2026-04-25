@@ -20,7 +20,7 @@ import (
 )
 
 func main() {
-	dsn := env("DATABASE_URL", "postgres://postgres:postgres@localhost:5432/taskqueue?sslmode=disable")
+	dsn := mustEnv("DATABASE_URL")
 	addr := env("ADDR", ":8080")
 	queues := strings.Split(env("QUEUES", "default,emails,notifications"), ",")
 
@@ -121,4 +121,13 @@ func env(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+// mustEnv exits with a clear message if a required env var is not set.
+func mustEnv(key string) string {
+	v := os.Getenv(key)
+	if v == "" {
+		log.Fatalf("required environment variable %q is not set", key)
+	}
+	return v
 }

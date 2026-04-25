@@ -1,0 +1,15 @@
+# Compiled binaries
+bin/
+*.exe
+
+# Block generic .env and production secrets
+.env
+.env.prod
+
+# Allow environment-specific files
+!.env.dev
+!.env.staging
+!.env.example
+
+# macOS
+.DS_Store
