@@ -13,7 +13,7 @@ graph TD
     M["internal/models\njob.go"]
     PG[("Postgres")]
 
-    CLI -->|HTTP calls only| SRV
+    CLI -->|"HTTP over network\n(not a Go import)"| API
     SRV --> API
     SRV --> W
     API --> Q
@@ -62,6 +62,15 @@ erDiagram
     jobs ||--o{ dead_letter_jobs : "moves to on exhaustion"
 ```
 
+### DB Indexes
+
+| Index | Columns | Purpose |
+|---|---|---|
+| `idx_jobs_queue_status_next_run` | `queue_name, status, priority DESC, next_run_at` | Fast dequeue — partial index on `status = pending` |
+| `idx_jobs_status` | `status` | Fast filtering in list/stats queries |
+| `idx_dlq_queue` | `queue_name` | Fast DLQ listing per queue |
+| `idx_dlq_original` | `original_job_id` | Look up DLQ entry by original job |
+
 ---
 
 ## Worker Pool Internals
@@ -70,6 +79,9 @@ erDiagram
 flowchart TD
     Start["Pool.Start(ctx)"]
     Ticker["time.Ticker\nevery 2s"]
+    CtxDone{ctx.Done?}
+    Drain["Drain semaphore\nwait for in-flight jobs"]
+    Stop["Pool stopped"]
     Sem["Semaphore channel\ncap = concurrency"]
     Goroutine["go processOne(queue)"]
     Dequeue["store.DequeueJob\nSELECT FOR UPDATE SKIP LOCKED"]
@@ -81,7 +93,9 @@ flowchart TD
     Done["release semaphore slot"]
 
     Start --> Ticker
-    Ticker -->|each tick, each queue| Sem
+    Ticker --> CtxDone
+    CtxDone -->|shutdown signal| Drain --> Stop
+    CtxDone -->|each tick, each queue| Sem
     Sem -->|acquire slot| Goroutine
     Goroutine --> Dequeue
     Dequeue --> Empty
@@ -94,11 +108,41 @@ flowchart TD
 
 ---
 
+## Concurrency Model
+
+```mermaid
+graph LR
+    subgraph "Worker Pool (concurrency = 10)"
+        S["Semaphore\nchan struct{} cap=10"]
+        G1["goroutine 1"]
+        G2["goroutine 2"]
+        G3["goroutine 3"]
+        GN["goroutine N"]
+    end
+
+    T["Ticker\nevery 2s"] -->|tick| S
+    S --> G1
+    S --> G2
+    S --> G3
+    S --> GN
+    G1 -->|SKIP LOCKED| PG[("Postgres")]
+    G2 -->|SKIP LOCKED| PG
+    G3 -->|SKIP LOCKED| PG
+    GN -->|SKIP LOCKED| PG
+```
+
+Each tick spawns one goroutine per queue. The semaphore ensures at most `concurrency` goroutines run simultaneously. `SKIP LOCKED` ensures no two goroutines pick the same job.
+
+---
+
 ## API Layer
 
 ```mermaid
 flowchart LR
-    subgraph net/http ServeMux
+    MW["loggingMiddleware\nmethod + path + status + latency"]
+    MW --> MUX
+
+    subgraph MUX["net/http ServeMux"]
         R1["POST /jobs"]
         R2["GET  /jobs"]
         R3["GET  /jobs/{id}"]
@@ -114,6 +158,7 @@ flowchart LR
     R4 --> ST3["db.Store\n.QueueStats()"]
     R5 --> ST4["db.Store\n.ListDLQ()"]
     R6 --> ST5["db.Store\n.RequeueDLQ()"]
+    R7 --> OK["200 ok"]
 ```
 
 ---
@@ -131,22 +176,6 @@ flowchart LR
 
 ---
 
-## Job Status Transitions
-
-```mermaid
-stateDiagram-v2
-    [*] --> pending : POST /jobs
-    pending --> running : worker dequeues\n(SKIP LOCKED)
-    running --> completed : handler returns nil
-    running --> failed : handler returns error\n(retries remain)
-    failed --> pending : next_run_at elapsed
-    running --> dead : handler returns error\n(max retries reached)
-    dead --> pending : POST /dlq/:id/requeue
-    completed --> [*]
-```
-
----
-
 ## Retry Backoff Values
 
 | Attempt | Delay before next retry |
@@ -156,5 +185,31 @@ stateDiagram-v2
 | 3rd failure | 8 seconds |
 | 4th failure | 16 seconds |
 | 5th failure | 32 seconds |
-| … | … (doubles each time) |
-| > ~36 attempts | capped at **1 hour** |
+| 6th failure | 64 seconds |
+| 7th failure | 128 seconds |
+| 8th failure | 256 seconds |
+| 9th failure | 512 seconds |
+| 10th failure | 1024 seconds |
+| 11th failure | 2048 seconds |
+| **> 11 attempts** | capped at **1 hour** |
+
+---
+
+## Graceful Shutdown Sequence
+
+```mermaid
+sequenceDiagram
+    participant OS as OS Signal\n(Ctrl+C)
+    participant SRV as HTTP Server
+    participant WP as Worker Pool
+    participant DB as Postgres
+
+    OS->>SRV: SIGINT / SIGTERM
+    SRV->>WP: cancel workerCtx
+    WP->>WP: stop accepting new jobs\n(ticker stops)
+    WP->>WP: drain semaphore\n(wait for in-flight jobs)
+    WP->>DB: finish current UPDATE / INSERT
+    WP-->>SRV: all workers stopped
+    SRV->>SRV: srv.Shutdown(15s timeout)
+    SRV-->>OS: process exits cleanly
+```
