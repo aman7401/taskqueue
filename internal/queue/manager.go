@@ -87,9 +87,8 @@ func (m *Manager) Nack(ctx context.Context, job *models.Job, errMsg string) erro
 
 // exponentialBackoff returns 2^attempt seconds, capped at 1 hour.
 func exponentialBackoff(attempt int) time.Duration {
-	delay := time.Duration(1<<uint(attempt)) * time.Second
-	if delay > time.Hour {
-		delay = time.Hour
+	if attempt > 11 {
+		return time.Hour
 	}
-	return delay
+	return time.Duration(1<<uint(attempt)) * time.Second
 }

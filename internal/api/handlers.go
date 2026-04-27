@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"strconv"
@@ -11,9 +12,21 @@ import (
 	"github.com/google/uuid"
 )
 
+type jobManager interface {
+	Enqueue(ctx context.Context, req *models.SubmitRequest) (*models.Job, error)
+}
+
+type jobStore interface {
+	ListJobs(ctx context.Context, queueName, status string, limit, offset int) ([]*models.Job, error)
+	GetJob(ctx context.Context, id uuid.UUID) (*models.Job, error)
+	QueueStats(ctx context.Context, queueName string) (*models.QueueStats, error)
+	ListDLQ(ctx context.Context, queueName string, limit, offset int) ([]*models.DeadLetterJob, error)
+	RequeueDLQ(ctx context.Context, dlqID uuid.UUID) (*models.Job, error)
+}
+
 type Handler struct {
-	mgr   *queue.Manager
-	store *db.Store
+	mgr   jobManager
+	store jobStore
 }
 
 func NewHandler(mgr *queue.Manager, store *db.Store) *Handler {
